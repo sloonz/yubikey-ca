@@ -1,0 +1,320 @@
+#!/usr/bin/python3
+
+import argparse
+import base64
+import datetime
+import functools
+import getpass
+import hashlib
+import os
+import signal
+import subprocess
+import sys
+import threading
+
+@functools.lru_cache()
+def get_pin():
+    pin = os.getenv('PIN', '123456')
+    if pin == 'ask':
+        pin = getpass.getpass('PIN: ')
+    return pin
+
+def get_ca_cert():
+    return run('p11tool', '--provider=%s' % pkcs11_module, '--export', '%s;type=cert' % args.pkcs11_url).strip()+b"\n"
+
+def get_ssh_ca():
+    pubkey = run('openssl', 'x509', '-noout', '-pubkey', input=get_ca_cert())
+    return run('ssh-keygen', '-i', '-m', 'PKCS8', '-f', '/dev/stdin', input=pubkey)
+
+class Shell:
+    def __init__(self):
+        self.out = {}
+        self.pass_fds = []
+        self.pipeout_fds = []
+
+    def pipein(self, data):
+        """
+        Equivalent of zsh/bash <() operator
+        Create a pipe, send data to it so a child process can read it as a /proc/self/fd/ file
+        """
+        rfd, wfd = os.pipe()
+        if os.fork() == 0:
+            os.close(rfd)
+            while data:
+                data = data[os.write(wfd, data):]
+            os.close(wfd)
+            sys.exit(0)
+        else:
+            self.pass_fds.append(rfd)
+            os.close(wfd)
+            return "/proc/self/fd/%s" % rfd
+
+    def pipeout(self, name):
+        """
+        Provides a fd usable by the subprocess for writing
+        Its result will be in sh.out[name]
+        """
+        rfd, wfd = os.pipe()
+        self.pass_fds.append(wfd)
+        self.pipeout_fds.append((name, rfd))
+        return "/proc/self/fd/%s" % wfd
+
+    def _read_pipe(self, name, rfd):
+        with os.fdopen(rfd, 'rb') as f:
+            self.out[name] = f.read()
+
+    def _close_fds(self):
+        for fd in self.pass_fds:
+            os.close(fd)
+        self.pass_fds.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._close_fds()
+
+    def run(self, *args, input=None, **kwargs):
+        kwargs.setdefault('stdout', subprocess.PIPE)
+        if input is not None:
+            kwargs.setdefault('stdin', subprocess.PIPE)
+        with subprocess.Popen(args, pass_fds=self.pass_fds, **kwargs) as process:
+            self._close_fds()
+            threads = []
+            for pfd in self.pipeout_fds:
+                thread = threading.Thread(target=self._read_pipe, args=pfd)
+                thread.start()
+                threads.append(thread)
+            stdout, stderr = process.communicate(input)
+            retcode = process.wait()
+            [thread.join() for thread in threads]
+            if retcode:
+                raise subprocess.CalledProcessError(retcode, process.args, output=stdout, stderr=stderr)
+            return stdout
+
+def run(*args, **kwargs):
+    with Shell() as sh:
+        return sh.run(*args, **kwargs)
+
+def ca_commit(message):
+    for f in ['index.txt.old', 'serial.old', 'index.txt.attr.old', 'crlnumber.old']:
+        if os.path.exists(f):
+            os.unlink(f)
+
+    subprocess.check_call(['git', 'add', 'ssh-index.txt'])
+    subprocess.check_call(['git', 'add', 'index.txt'])
+    subprocess.check_call(['git', 'add', 'index.txt.attr'])
+    subprocess.check_call(['git', 'add', 'crlnumber'])
+    subprocess.check_call(['git', 'add', 'serial'])
+    subprocess.check_call(['git', 'add', 'certs'])
+    subprocess.check_output(['git', 'commit', '-m', message])
+
+def openssl_ca(sh):
+    return ('openssl', 'ca', '-config', sh.pipein(ca_config.encode()), '-engine', 'pkcs11', '-keyform', 'engine', '-batch',
+            '-keyfile', args.pkcs11_url, '-passin', 'pass:%s' % get_pin(), '-cert', sh.pipein(get_ca_cert()))
+
+parser = argparse.ArgumentParser()
+subparsers = parser.add_subparsers(dest='action')
+
+parser.add_argument('--pkcs11-module', '-m', default=os.getenv('PKCS11_MODULE', 'opensc-pkcs11.so'))
+parser.add_argument('--pkcs11-url', '-u', default=os.getenv('PKCS11_URL', 'pkcs11:manufacturer=piv_II;id=%02'))
+parser.add_argument('--debug', action='store_true')
+
+subparsers.add_parser('ssh-ca')
+subparsers.add_parser('ca-cert')
+
+parser_init_key = subparsers.add_parser('init-key')
+parser_init_key.add_argument('--subject', '-s', default='/CN=Yubikey CA')
+parser_init_key.add_argument('--keyfile', '-k', default='/dev/stdin')
+parser_init_key.add_argument('--generate', '-g', action='store_true', help='Generate key on device')
+
+parser_init_ca = subparsers.add_parser('init-ca')
+
+parser_ssh_cert = subparsers.add_parser('ssh-cert')
+parser_ssh_cert.add_argument('--principals', '-n', help='comma-separated list of principals (see CERTIFICATES in ssh-keygen)')
+parser_ssh_cert.add_argument('--id', '-I')
+parser_ssh_cert.add_argument('keyfile')
+
+parser_client_cert = subparsers.add_parser('client-cert')
+parser_client_cert.add_argument('--subject', '-s', required=True)
+parser_client_cert.add_argument('--keyfile', '-k', default='/dev/stdin')
+parser_client_cert.add_argument('--pkcs12', '-e', action='store_true')
+
+parser_client_revoke = subparsers.add_parser('client-revoke')
+parser_client_revoke.add_argument('serial', nargs='+')
+
+parser_client_revoke = subparsers.add_parser('ssh-revoke')
+parser_client_revoke.add_argument('serial', nargs='+')
+
+parser_crl = subparsers.add_parser('crl')
+parser_crl = subparsers.add_parser('krl')
+
+args = parser.parse_args()
+
+if args.debug:
+    os.environ['PKCS11SPY'] = args.pkcs11_module
+    pkcs11_module = 'pkcs11-spy.so'
+else:
+    pkcs11_module = args.pkcs11_module
+
+ca_config = '\n'.join([
+    'openssl_conf = openssl_init',
+    '[ca]',
+    'default_ca = ca_section',
+    '[ca_section]',
+    'database = ./index.txt',
+    'crlnumber = ./crlnumber',
+    'serial = ./serial',
+    'new_certs_dir = ./certs',
+    'crl = ./crl.pem',
+    'unique_subject = no',
+    'x509_extensions = usr_section',
+    'default_md = sha256',
+    'default_crl_days = 30',
+    'policy = policy_section',
+    '[policy_section]',
+    'countryName = optional',
+    'stateOrProvinceName = optional',
+    'organizationName = optional',
+    'organizationalUnitName = optional',
+    'commonName = supplied',
+    'emailAddress = optional',
+    '[usr_section]',
+    'basicConstraints=CA:FALSE',
+    'nsCertType = client, email',
+    '[openssl_init]',
+    'engines = engine_section',
+    '[engine_section]',
+    'pkcs11 = pkcs11_section',
+    '[pkcs11_section]',
+    'engine_id = pkcs11',
+    'MODULE_PATH = %s' % pkcs11_module,
+    'init = 0',
+    (args.debug and 'VERBOSE = EMPTY' or ''),
+])
+
+if args.action == 'init-key':
+    if args.generate:
+        pubkey = run('yubico-piv-tool', '-s9c', '-agenerate', '-ARSA2048')
+        # Generate a temporary self-signed certificate in order to make openssl happy
+        with Shell() as sh:
+            cert = sh.run('yubico-piv-tool', '-s9c', '-averify', '-P%s' % get_pin(), '-aselfsign', '-i%s' % sh.pipein(pubkey), '-S/CN=TempCA')
+        with Shell() as sh:
+            sh.run('yubico-piv-tool', '-s9c', '-aimport-certificate', '-i%s' % sh.pipein(cert))
+        # Selfsign with openssl now, in order to have CA in purposes
+        with Shell() as sh:
+            cert = sh.run('openssl', 'req', '-x509', '-days', '3650', '-sha256', '-subj', args.subject, '-engine', 'pkcs11',
+                          '-keyform', 'engine', '-key', args.pkcs11_url, '-passin', 'pass:%s' % get_pin())
+    else:
+        key = open(args.keyfile, 'rb').read()
+        with Shell() as sh:
+            sh.run('yubico-piv-tool', '-s9c', '-aimport-key', '-i', sh.pipein(key))
+        with Shell() as sh:
+            cert = sh.run('openssl', 'req', '-x509', '-days', '3650', '-sha256', '-subj', args.subject, '-key', sh.pipein(key))
+    with Shell() as sh:
+        sh.run('yubico-piv-tool', '-s9c', '-aimport-certificate', '-i', sh.pipein(cert))
+
+if args.action == 'init-ca':
+    if not os.path.exists('.git'):
+        subprocess.check_call(['git', 'init'])
+    if not os.path.exists('certs'):
+        os.mkdir('certs')
+    for f in ('index.txt', 'index.txt.attr', 'ssh-index.txt', 'certs/.keep'):
+        if not os.path.exists(f):
+            with open(f, 'w+') as fd:
+                pass
+    for f in ('crlnumber', 'serial'):
+        if not os.path.exists(f):
+            with open(f, 'w+') as fd:
+                fd.write('00\n')
+    for f in ('index.txt', 'index.txt.attr', 'ssh-index.txt', 'certs', 'serial', 'crlnumber'):
+        subprocess.check_call(['git', 'add', f])
+    subprocess.check_output(['git', 'commit', '-m', 'CA initialization'])
+
+if args.action == 'ssh-ca':
+    sys.stdout.buffer.write(get_ssh_ca())
+
+if args.action == 'ca-cert':
+    sys.stdout.buffer.write(get_ca_cert())
+
+if args.action == 'ssh-cert':
+    keyfile = args.keyfile
+    if not keyfile.endswith('.pub') and os.path.exists(keyfile + '.pub'):
+        keyfile += '.pub'
+
+    with open(keyfile) as fd:
+        pubkey = fd.read().strip()
+
+    sshca = get_ssh_ca()
+    if args.id:
+        keyid = args.id
+    else:
+        keyid = pubkey.split(maxsplit=2)[2]
+    serial = int(os.urandom(8).hex(), 16)
+    with Shell() as sh:
+        ssh_keygen_args = ['-s', sh.pipein(sshca), '-D', pkcs11_module, '-I', keyid, '-z', str(serial)]
+        if args.principals:
+            ssh_keygen_args.append('-n')
+            ssh_keygen_args.append(args.principals)
+        ssh_keygen_args.append(keyfile)
+        sys.stdout.buffer.write(sh.run('ssh-keygen', *ssh_keygen_args))
+    pubkey_encoded = base64.b64encode(pubkey.encode()).decode()
+    principals = (args.principals and args.principals) or ''
+    now = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    with open('ssh-index.txt', 'a+') as fd:
+        fd.write('V serial:{serial} added:{now} pub:{pubkey_encoded} principals:{principals} id:{keyid}\n'.format(**locals()))
+    ca_commit('SSH: Issuing certificate  %s\n\nId: %s' % (serial, keyid))
+
+if args.action == 'client-cert':
+    key = open(args.keyfile, 'rb').read()
+    with Shell() as sh:
+        csr = sh.run('openssl', 'req', '-new', '-key', sh.pipein(key), '-sha256', '-days', '365', '-subj', args.subject)
+
+    with open('serial') as fd:
+        serial = fd.read()
+
+    with Shell() as sh:
+        cert = sh.run(*openssl_ca(sh), '-in', sh.pipein(csr), '-days', '365', '-notext')
+
+    if args.pkcs12:
+        with Shell() as sh:
+            sh.run('openssl', 'pkcs12', '-export', '-in', sh.pipein(cert), '-inkey', sh.pipein(key), stdout=None)
+    else:
+        sys.stdout.buffer.write(cert)
+
+    ca_commit('SSL: Issuing certificate %s\n\nSubject: %s' % (serial, args.subject))
+
+if args.action == 'client-revoke':
+    for serial in args.serial:
+        with Shell() as sh:
+            sh.run(*openssl_ca(sh), '-revoke', 'certs/%s.pem' % serial, stdout=None)
+    ca_commit('SSL: Revokating certificates\n\nSerials: %s' % ', '.join(args.serial))
+
+if args.action == 'crl':
+    with Shell() as sh:
+        sh.run(*openssl_ca(sh), '-gencrl', '-crldays', '3650', stdout=None)
+    ca_commit('Issuing a new CRL')
+
+if args.action == 'ssh-revoke':
+    serials = set("serial:%s" % s for s in args.serial)
+    new_index = []
+    with open('ssh-index.txt') as fd:
+        for entry in fd:
+            validity, serial, data = entry.strip().split(maxsplit=2)
+            if serial in serials:
+                validity = 'R'
+            new_index.append("%s %s %s" % (validity, serial, data))
+    with open('ssh-index.txt', 'w+') as fd:
+        fd.write('\n'.join(new_index) + '\n')
+    ca_commit('SSH: Revokating certificates\n\nSerials:\n%s\n' % '\n'.join(serials))
+
+if args.action == 'krl':
+    krl_data = []
+    with open('ssh-index.txt') as fd:
+        for entry in fd:
+            validity, serial, data = entry.strip().split(maxsplit=2)
+            if validity == 'R':
+                krl_data.append('serial: %s' % serial.split(':')[1])
+    with Shell() as sh:
+        sh.run('ssh-keygen', '-k', '-f', sh.pipeout('krl'), '-s', sh.pipein(get_ssh_ca()), sh.pipein('\n'.join(krl_data).encode()), stdout=sys.stderr)
+        sys.stdout.buffer.write(sh.out['krl'])
