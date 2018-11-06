@@ -133,6 +133,7 @@ parser_init_ca = subparsers.add_parser('init-ca')
 parser_ssh_cert = subparsers.add_parser('ssh-cert')
 parser_ssh_cert.add_argument('--principals', '-n', help='comma-separated list of principals (see CERTIFICATES in ssh-keygen)')
 parser_ssh_cert.add_argument('--id', '-I')
+parser_ssh_cert.add_argument('--options', '-O', action='append', default=[])
 parser_ssh_cert.add_argument('keyfile')
 
 parser_client_cert = subparsers.add_parser('client-cert')
@@ -256,6 +257,10 @@ if args.action == 'ssh-cert':
         if args.principals:
             ssh_keygen_args.append('-n')
             ssh_keygen_args.append(args.principals)
+        if args.options:
+            for opt in args.options:
+                ssh_keygen_args.append('-O')
+                ssh_keygen_args.append(opt)
         ssh_keygen_args.append(keyfile)
         sys.stdout.buffer.write(sh.run('ssh-keygen', *ssh_keygen_args))
     pubkey_encoded = base64.b64encode(pubkey.encode()).decode()
